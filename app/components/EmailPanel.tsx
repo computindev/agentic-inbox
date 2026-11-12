@@ -6,6 +6,7 @@ import { useKumoToastManager } from "@cloudflare/kumo";
 import { useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router";
 import { Folders } from "shared/folders";
+import CustomerDossierBanner from "~/components/email-panel/CustomerDossierBanner";
 import EmailPanelDialogs from "~/components/email-panel/EmailPanelDialogs";
 import EmailPanelHeader from "~/components/email-panel/EmailPanelHeader";
 import EmailPanelToolbar from "~/components/email-panel/EmailPanelToolbar";
@@ -118,6 +119,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 			const fromName = currentMailbox.settings?.fromName || currentMailbox.name;
 			const from = fromName && fromName !== currentMailbox.email ? { email: currentMailbox.email, name: fromName } : currentMailbox.email;
 			const originalEmail = target.in_reply_to ? allMessages.find((msg) => msg.id === target.in_reply_to) : undefined;
+			const replyTargetId = originalEmail?.id || target.in_reply_to;
 			const emailData = {
 				to: toEmailListValue(toRecipients),
 				cc: toEmailListValue(splitEmailList(target.cc)),
@@ -127,7 +129,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				html: target.body || "",
 				text: target.body ? target.body.replace(/<[^>]*>/g, "").trim() : "",
 			};
-			if (originalEmail) await replyMut.mutateAsync({ mailboxId, emailId: originalEmail.id, email: emailData }); else await sendEmailMut.mutateAsync({ mailboxId, email: emailData });
+			if (replyTargetId) await replyMut.mutateAsync({ mailboxId, emailId: replyTargetId, email: emailData }); else await sendEmailMut.mutateAsync({ mailboxId, email: emailData });
 			await deleteEmailMut.mutateAsync({ mailboxId, id: target.id });
 			toastManager.add({ title: "Email sent!" });
 			if (isDraftFolder) closePanel();
@@ -179,6 +181,15 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				subject={email.subject}
 				messageCount={allMessages.length}
 				showThreadCount={hasThread}
+			/>
+
+			<CustomerDossierBanner
+				mailboxId={mailboxId}
+				mailboxEmail={currentMailbox?.email}
+				mailboxAliases={currentMailbox?.settings?.aliases}
+				sender={lastReceivedMessage?.sender || email.sender}
+				recipient={lastReceivedMessage?.recipient || email.recipient}
+				emailSubject={email.subject}
 			/>
 
 			<div className="flex-1 overflow-y-auto">

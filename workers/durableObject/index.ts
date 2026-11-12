@@ -869,4 +869,104 @@ export class MailboxDO extends DurableObject<Env> {
 			this.db.insert(schema.attachments).values(attachments).run();
 		}
 	}
+
+	// ── Mailbox Migration Export / Import ──────────────────────────
+
+	async exportAllData() {
+		const folders = [...this.ctx.storage.sql.exec("SELECT * FROM folders")] as Array<{
+			id: string;
+			name: string;
+			is_deletable: number;
+		}>;
+		const emails = [...this.ctx.storage.sql.exec("SELECT * FROM emails ORDER BY date ASC")] as Array<
+			Record<string, unknown>
+		>;
+		const attachments = [
+			...this.ctx.storage.sql.exec("SELECT * FROM attachments"),
+		] as Array<Record<string, unknown>>;
+
+		return { folders, emails, attachments };
+	}
+
+	async importAllData(
+		data: {
+			folders: Array<{ id: string; name: string; is_deletable: number }>;
+			emails: Array<Record<string, unknown>>;
+			attachments: Array<Record<string, unknown>>;
+		},
+		options?: { oldEmail?: string; newEmail?: string },
+	) {
+		let foldersCopied = 0;
+		let emailsCopied = 0;
+		let attachmentsCopied = 0;
+
+		const oldEmail = options?.oldEmail?.toLowerCase().trim();
+		const newEmail = options?.newEmail?.toLowerCase().trim();
+
+		for (const f of data.folders || []) {
+			this.ctx.storage.sql.exec(
+				`INSERT OR IGNORE INTO folders (id, name, is_deletable) VALUES (?1, ?2, ?3)`,
+				f.id,
+				f.name,
+				f.is_deletable ?? 1,
+			);
+			foldersCopied++;
+		}
+
+		for (const e of data.emails || []) {
+			const folderId = String(e.folder_id || Folders.INBOX);
+			let sender = String(e.sender || "");
+			if (
+				folderId === Folders.DRAFT &&
+				oldEmail &&
+				newEmail &&
+				sender.toLowerCase().trim() === oldEmail
+			) {
+				sender = newEmail;
+			}
+
+			this.ctx.storage.sql.exec(
+				`INSERT OR IGNORE INTO emails (
+					id, folder_id, subject, sender, recipient, cc, bcc, date,
+					read, starred, body, in_reply_to, email_references,
+					thread_id, message_id, raw_headers
+				) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)`,
+				String(e.id),
+				folderId,
+				String(e.subject ?? ""),
+				sender,
+				String(e.recipient ?? ""),
+				(e.cc as string | null) ?? null,
+				(e.bcc as string | null) ?? null,
+				String(e.date ?? new Date().toISOString()),
+				Number(e.read ? 1 : 0),
+				Number(e.starred ? 1 : 0),
+				String(e.body ?? ""),
+				(e.in_reply_to as string | null) ?? null,
+				(e.email_references as string | null) ?? null,
+				(e.thread_id as string | null) ?? null,
+				(e.message_id as string | null) ?? null,
+				(e.raw_headers as string | null) ?? null,
+			);
+			emailsCopied++;
+		}
+
+		for (const a of data.attachments || []) {
+			this.ctx.storage.sql.exec(
+				`INSERT OR IGNORE INTO attachments (
+					id, email_id, filename, mimetype, size, content_id, disposition
+				) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+				String(a.id),
+				String(a.email_id),
+				String(a.filename ?? "untitled"),
+				String(a.mimetype ?? "application/octet-stream"),
+				Number(a.size ?? 0),
+				(a.content_id as string | null) ?? null,
+				(a.disposition as string | null) ?? "attachment",
+			);
+			attachmentsCopied++;
+		}
+
+		return { foldersCopied, emailsCopied, attachmentsCopied };
+	}
 }

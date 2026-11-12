@@ -23,6 +23,8 @@ import { useParams } from "react-router";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useUIStore } from "~/hooks/useUIStore";
+import { escapeHtml } from "~/lib/utils";
+import api from "~/services/api";
 import type { UIMessage } from "ai";
 
 const TOOL_LABELS: Record<string, { label: string; icon: React.ReactNode }> = {
@@ -100,13 +102,19 @@ function ToolCallBadge({
 function getToolNameFromPart(part: UIMessage["parts"][number]): string | null {
 	if (part.type === "dynamic-tool") return (part as any).toolName ?? null;
 	if (part.type.startsWith("tool-")) return part.type.replace("tool-", "");
+	if (typeof (part as any).toolName === "string") return (part as any).toolName;
 	return null;
 }
 
 function hasDraftReplyTool(message: UIMessage): boolean {
 	return message.parts.some((part) => {
 		const toolName = getToolNameFromPart(part);
-		return toolName === "draft_reply";
+		if (toolName !== "draft_reply" && toolName !== "draft_email") return false;
+		const raw = (part as any).output ?? (part as any).result;
+		if (raw && typeof raw === "object" && "error" in raw && raw.error) {
+			return false;
+		}
+		return true;
 	});
 }
 
@@ -307,6 +315,62 @@ function AgentChatConnected({
 	const [inputValue, setInputValue] = useState("");
 	const { startCompose } = useUIStore();
 
+	const openDraftInComposer = async (params: {
+		draftId?: string;
+		to?: string;
+		subject?: string;
+		body?: string;
+		inReplyTo?: string;
+		threadId?: string;
+		isReply?: boolean;
+	}) => {
+		if (params.draftId) {
+			try {
+				const storedDraft = await api.getEmail(mailboxId, params.draftId);
+				if (storedDraft) {
+					const resolvedInReplyTo =
+						storedDraft.in_reply_to || params.inReplyTo || null;
+					startCompose({
+						mode: params.isReply || resolvedInReplyTo ? "reply" : "new",
+						originalEmail: null,
+						draftEmail: {
+							...storedDraft,
+							in_reply_to: resolvedInReplyTo,
+						},
+					});
+					return;
+				}
+			} catch {
+				// Fall back to tool output payload if draft fetch fails
+			}
+		}
+
+		const rawBody = params.body || "";
+		const bodyHtml = /<[a-z][\s\S]*>/i.test(rawBody)
+			? rawBody
+			: rawBody
+					.split(/\n{2,}/)
+					.map((p) => `<p>${escapeHtml(p).replace(/\n/g, "<br>")}</p>`)
+					.join("");
+
+		startCompose({
+			mode: params.isReply || params.inReplyTo ? "reply" : "new",
+			originalEmail: null,
+			draftEmail: {
+				id: params.draftId || "",
+				subject: params.subject || "",
+				sender: mailboxId,
+				recipient: params.to || "",
+				date: new Date().toISOString(),
+				read: true,
+				starred: false,
+				body: bodyHtml,
+				in_reply_to: params.inReplyTo || null,
+				thread_id: params.threadId || null,
+			},
+		});
+	};
+
 	const agent = useAgent({ agent: "EmailAgent", name: mailboxId });
 	const { messages, sendMessage, status, setMessages, stop } =
 		useAgentChat({ agent });
@@ -412,45 +476,52 @@ function AgentChatConnected({
 								isStreaming={isStreaming}
 							onAction={(action) => {
 								if (action === "edit") {
-										// Extract draft data from the draft_reply tool result
-										let draftData: {
-											to?: string;
-											subject?: string;
-											body?: string;
-											id?: string;
-										} | null = null;
-										for (const part of msg.parts) {
-											if (
-												(part as any).toolName === "draft_reply" &&
-												(part as any).result
-											) {
-												draftData = (part as any).result;
+									let matchedToolName: string | null = null;
+									let matchedDraft: Record<string, any> | null = null;
+									let matchedDraftId: string | undefined;
+									let matchedThreadId: string | undefined;
+
+									for (let i = msg.parts.length - 1; i >= 0; i--) {
+										const part = msg.parts[i];
+										const toolName = getToolNameFromPart(part);
+										if (
+											toolName === "draft_reply" ||
+											toolName === "draft_email"
+										) {
+											const raw =
+												(part as any).output ?? (part as any).result;
+											if (raw && !raw.error) {
+												const draftObj = raw?.draft ?? raw;
+												const draftId = raw?.draftId ?? draftObj?.id;
+												matchedToolName = toolName;
+												matchedDraft = draftObj;
+												matchedDraftId = draftId;
+												matchedThreadId =
+													raw?.threadId ?? draftObj?.thread_id;
 												break;
 											}
 										}
-										if (draftData) {
-											const draftEmail = {
-												id: draftData.id || "",
-												subject: draftData.subject || "",
-												sender: mailboxId,
-												recipient: draftData.to || "",
-												date: new Date().toISOString(),
-												read: true,
-												starred: false,
-												body: draftData.body || "",
-											};
-											startCompose({
-												mode: "reply",
-												originalEmail: null,
-												draftEmail,
-											});
-										} else {
-											sendMessage({
-												text: "Let me edit this draft first. Show me what you have so I can modify it.",
-											});
-										}
 									}
-								}}
+
+									if (matchedDraft) {
+										void openDraftInComposer({
+											draftId: matchedDraftId,
+											to: matchedDraft.to || matchedDraft.recipient,
+											subject: matchedDraft.subject,
+											body: matchedDraft.body,
+											inReplyTo:
+												matchedDraft.originalEmailId ||
+												matchedDraft.in_reply_to,
+											threadId: matchedThreadId,
+											isReply: matchedToolName === "draft_reply",
+										});
+									} else {
+										sendMessage({
+											text: "Let me edit this draft first. Show me what you have so I can modify it.",
+										});
+									}
+								}
+							}}
 							/>
 						))}
 						{isStreaming && (

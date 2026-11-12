@@ -3,40 +3,38 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 /**
- * Shared tool business logic for the Agent and MCP server.
- *
- * Each function takes an `env: Env` (or a DO stub) and tool-specific params,
- * performs the business logic (DO calls, data fetching, formatting), and
- * returns a plain object. The Agent and MCP server wrap these results in
- * their own response formats.
- *
- * Functions that already exist in email-helpers.ts (getFullEmail, getFullThread)
- * are reused directly — this module covers the remaining shared operations.
+ * Shared tool business logic for the EmailAgent and MCP server (`CF-02`, `CF-07`, `CF-12`, `TOP 6`).
  */
 
 import type { EmailFull } from "./schemas";
 import {
 	getMailboxStub,
+	getMailboxSettings,
 	getFullEmail,
 	getFullThread,
 	buildQuotedReplyBlock,
 	textToHtml,
-	listMailboxes,
+	listMailboxesWithSettings,
 	generateMessageId,
 	buildReferencesChain,
-	buildThreadingHeaders,
+	buildOutboundHeaders,
+	resolveOutboundFrom,
+	appendSignature,
+	deleteEmailWithAttachments,
 } from "./email-helpers";
-import { verifyDraft } from "./ai";
-import { sendEmail } from "../email-sender";
+import {
+	verifyDraft,
+	verifyDraftDeterministically,
+	checkPersonaGovernance,
+} from "./ai";
+import { fetchClientDossier } from "./cobrador-bridge";
+import { sendOutboundEmail } from "../email-sender";
 import { Folders } from "../../shared/folders";
+import { parseSearchQuery, type ParsedSearch } from "../../shared/search-parser";
 import type { Env } from "../types";
 
-// ── Type casts for DO methods not on the base stub type ────────────
 type MailboxSearchStub = {
-	searchEmails: (options: {
-		query: string;
-		folder?: string;
-	}) => Promise<unknown>;
+	searchEmails: (options: ParsedSearch & { page?: number; limit?: number }) => Promise<unknown>;
 };
 
 type RateLimitStub = {
@@ -46,7 +44,7 @@ type RateLimitStub = {
 // ── list_mailboxes ─────────────────────────────────────────────────
 
 export async function toolListMailboxes(env: Env) {
-	return listMailboxes(env.BUCKET);
+	return listMailboxesWithSettings(env.BUCKET);
 }
 
 // ── list_emails ────────────────────────────────────────────────────
@@ -90,7 +88,7 @@ export async function toolGetThread(
 	return getFullThread(stub, threadId);
 }
 
-// ── search_emails ──────────────────────────────────────────────────
+// ── search_emails (with Gmail-style operator parser — CF-07) ───────
 
 export async function toolSearchEmails(
 	env: Env,
@@ -98,24 +96,15 @@ export async function toolSearchEmails(
 	params: { query: string; folder?: string },
 ) {
 	const stub = getMailboxStub(env, mailboxId);
+	const parsed = parseSearchQuery(params.query || "");
 	return (stub as unknown as MailboxSearchStub).searchEmails({
-		query: params.query,
-		folder: params.folder,
+		...parsed,
+		folder: params.folder || parsed.folder,
 	});
 }
 
 // ── draft_reply ────────────────────────────────────────────────────
 
-/**
- * Shared draft-reply logic.
- *
- * @param bodyInput - The reply body text. Can be plain text or HTML.
- * @param options.isPlainText - If true, body is treated as plain text and
- *   converted to HTML. If false, body is treated as HTML.
- * @param options.runVerifyDraft - If true, runs AI verifyDraft on the body.
- *   The agent and MCP both do this, but the agent does it on plain text
- *   while MCP does it on HTML.
- */
 export async function toolDraftReply(
 	env: Env,
 	mailboxId: string,
@@ -128,33 +117,40 @@ export async function toolDraftReply(
 		runVerifyDraft?: boolean;
 	},
 ): Promise<
-	| { status: "draft_saved"; draftId: string; message: string; draft: Record<string, string> }
+	| {
+			status: "draft_saved";
+			draftId: string;
+			message: string;
+			verificationCode?: string;
+			verificationWarnings?: string[];
+			draft: Record<string, string>;
+	  }
 	| { error: string }
 > {
 	const stub = getMailboxStub(env, mailboxId);
+	const settings = await getMailboxSettings(env.BUCKET, mailboxId);
 
-	// Verify/sanitize if requested
 	let processedBody = params.body.trim();
 	if (params.runVerifyDraft) {
 		const sanitized = await verifyDraft(env.AI, processedBody);
-		if (!sanitized) {
-			return { error: "Draft verification failed — body could not be verified. Please try again." };
-		}
-		processedBody = sanitized;
+		processedBody = sanitized || processedBody;
 	}
 
-	// Convert plain text to HTML if needed
 	if (params.isPlainText) {
-		processedBody = textToHtml(processedBody);
+		const withSigText = appendSignature(processedBody, settings.signature, false);
+		processedBody = textToHtml(withSigText);
+	} else {
+		processedBody = appendSignature(processedBody, settings.signature, true);
 	}
+
+	// Deterministic financial & link check against live Dossier (`TOP 6`)
+	const dossier = params.to ? await fetchClientDossier(env, params.to) : null;
+	const detCheck = verifyDraftDeterministically(processedBody, { dossier });
 
 	const draftId = crypto.randomUUID();
-
-	// Get the original email for thread_id and quoted text
 	const original = (await stub.getEmail(params.originalEmailId)) as EmailFull | null;
 	const threadId = original?.thread_id || params.originalEmailId;
 
-	// Append quoted original message
 	const quotedBlock = original
 		? buildQuotedReplyBlock({
 				date: original.date,
@@ -180,15 +176,26 @@ export async function toolDraftReply(
 		[],
 	);
 
+	const warnings = detCheck.mismatches.map((m) => m.reason);
+
 	return {
 		status: "draft_saved",
 		draftId,
-		message: "Draft saved to Drafts folder. Review it and confirm to send.",
+		verificationCode: detCheck.code,
+		...(warnings.length > 0 ? { verificationWarnings: warnings } : {}),
+		message:
+			warnings.length > 0
+				? `Draft saved with ${warnings.length} financial verification warning(s): ${warnings.join(" | ")}`
+				: "Draft saved to Drafts folder. Review it and confirm to send.",
 		draft: {
+			id: draftId,
 			originalEmailId: params.originalEmailId,
+			in_reply_to: params.originalEmailId,
 			to: params.to,
 			subject: params.subject,
-			body: params.isPlainText ? params.body.trim() : bodyHtml,
+			body: params.isPlainText
+				? appendSignature(params.body.trim(), settings.signature, false)
+				: bodyHtml,
 		},
 	};
 }
@@ -204,33 +211,42 @@ export async function toolDraftEmail(
 		body: string;
 		isPlainText?: boolean;
 		runVerifyDraft?: boolean;
-		/** Optional in_reply_to for create_draft style */
 		in_reply_to?: string;
-		/** Optional thread_id for create_draft style */
 		thread_id?: string;
 	},
 ): Promise<
-	| { status: string; draftId: string; threadId?: string; message: string; draft?: Record<string, string> }
+	| {
+			status: string;
+			draftId: string;
+			threadId?: string;
+			verificationCode?: string;
+			verificationWarnings?: string[];
+			message: string;
+			draft?: Record<string, string>;
+	  }
 	| { error: string }
 > {
 	const stub = getMailboxStub(env, mailboxId);
+	const settings = await getMailboxSettings(env.BUCKET, mailboxId);
 
 	let processedBody = params.body.trim();
 	if (params.runVerifyDraft) {
 		const sanitized = await verifyDraft(env.AI, processedBody);
-		if (!sanitized) {
-			return { error: "Draft verification failed — body could not be verified. Please try again." };
-		}
-		processedBody = sanitized;
+		processedBody = sanitized || processedBody;
 	}
 
 	if (params.isPlainText) {
-		processedBody = textToHtml(processedBody);
+		const withSigText = appendSignature(processedBody, settings.signature, false);
+		processedBody = textToHtml(withSigText);
+	} else {
+		processedBody = appendSignature(processedBody, settings.signature, true);
 	}
+
+	const dossier = params.to ? await fetchClientDossier(env, params.to) : null;
+	const detCheck = verifyDraftDeterministically(processedBody, { dossier });
 
 	const draftId = crypto.randomUUID();
 
-	// Resolve thread ID
 	let resolvedThreadId = params.thread_id;
 	if (!resolvedThreadId && params.in_reply_to) {
 		const original = (await stub.getEmail(params.in_reply_to)) as EmailFull | null;
@@ -256,15 +272,28 @@ export async function toolDraftEmail(
 		[],
 	);
 
+	const warnings = detCheck.mismatches.map((m) => m.reason);
+
 	return {
 		status: "draft_saved",
 		draftId,
 		threadId: resolvedThreadId,
-		message: "Draft saved to Drafts folder. Review it and confirm to send.",
+		verificationCode: detCheck.code,
+		...(warnings.length > 0 ? { verificationWarnings: warnings } : {}),
+		message:
+			warnings.length > 0
+				? `Draft saved with ${warnings.length} financial verification warning(s): ${warnings.join(" | ")}`
+				: "Draft saved to Drafts folder. Review it and confirm to send.",
 		draft: {
+			id: draftId,
+			...(params.in_reply_to
+				? { originalEmailId: params.in_reply_to, in_reply_to: params.in_reply_to }
+				: {}),
 			to: params.to,
 			subject: params.subject,
-			body: params.isPlainText ? params.body.trim() : processedBody,
+			body: params.isPlainText
+				? appendSignature(params.body.trim(), settings.signature, false)
+				: processedBody,
 		},
 	};
 }
@@ -291,16 +320,11 @@ export async function toolUpdateDraft(
 		return { error: "Draft not found" };
 	}
 
-	// Verify the body BEFORE deleting the old draft to prevent data loss
 	const newDraftId = crypto.randomUUID();
 	const rawBody = params.bodyHtml ?? oldDraft.body ?? "";
-	const verifiedBody = await verifyDraft(env.AI, rawBody);
+	const verifiedBody = (await verifyDraft(env.AI, rawBody)) || rawBody;
 
-	if (!verifiedBody) {
-		return { error: "Draft verification failed — keeping existing draft unchanged. Please try again." };
-	}
-
-	await stub.deleteEmail(params.draftId);
+	await deleteEmailWithAttachments(stub, env.BUCKET, params.draftId);
 	await stub.createEmail(
 		Folders.DRAFT,
 		{
@@ -354,7 +378,7 @@ export async function toolMoveEmail(
 	return { error: "Failed to move email" };
 }
 
-// ── discard_draft ──────────────────────────────────────────────────
+// ── discard_draft (with R2 blob cleanup — CF-12) ───────────────────
 
 export async function toolDiscardDraft(
 	env: Env,
@@ -369,11 +393,11 @@ export async function toolDiscardDraft(
 	if (email.folder_id !== Folders.DRAFT) {
 		return { error: "Cannot discard: email is not a draft" };
 	}
-	await stub.deleteEmail(draftId);
+	await deleteEmailWithAttachments(stub, env.BUCKET, draftId);
 	return { status: "discarded", draftId };
 }
 
-// ── delete_email ───────────────────────────────────────────────────
+// ── delete_email (with R2 blob cleanup — CF-12) ────────────────────
 
 export async function toolDeleteEmail(
 	env: Env,
@@ -381,14 +405,14 @@ export async function toolDeleteEmail(
 	emailId: string,
 ) {
 	const stub = getMailboxStub(env, mailboxId);
-	const result = await stub.deleteEmail(emailId);
+	const result = await deleteEmailWithAttachments(stub, env.BUCKET, emailId);
 	if (result === null) {
 		return { error: "Email not found", emailId };
 	}
 	return { status: "deleted", emailId };
 }
 
-// ── send_reply ─────────────────────────────────────────────────────
+// ── send_reply (with fromName, signature, Message-ID & Governance) ─
 
 export async function toolSendReply(
 	env: Env,
@@ -398,14 +422,26 @@ export async function toolSendReply(
 		to: string;
 		subject: string;
 		bodyHtml: string;
+		confirmedByHuman?: boolean;
 	},
 ): Promise<
-	| { status: "sent"; messageId: string; message: string }
+	| { status: "sent"; messageId: string; provider: string; message: string }
 	| { error: string }
 > {
 	const stub = getMailboxStub(env, mailboxId);
+	const settings = await getMailboxSettings(env.BUCKET, mailboxId);
 
-	// Check send rate limit
+	// Persona Governance (`Pablo` vs `Antonio` — TOP 6)
+	const governance = checkPersonaGovernance({
+		mailboxId,
+		settings,
+		body: params.bodyHtml,
+		confirmedByHuman: params.confirmedByHuman,
+	});
+	if (!governance.allowed) {
+		return { error: governance.error! };
+	}
+
 	const rateLimitError = await (stub as unknown as RateLimitStub).checkSendRateLimit();
 	if (rateLimitError) {
 		return { error: rateLimitError };
@@ -421,26 +457,43 @@ export async function toolSendReply(
 	if (!fromDomain) throw new Error("Invalid mailbox email address");
 	const { messageId, outgoingMessageId } = generateMessageId(fromDomain);
 
-	// Verify and append quoted original message
-	const sanitizedBody = await verifyDraft(env.AI, params.bodyHtml);
-	if (!sanitizedBody) {
-		return { error: "Draft verification failed — refusing to send unverified content. Please try again." };
+	const sanitizedBody = (await verifyDraft(env.AI, params.bodyHtml)) || params.bodyHtml;
+	const signedBody = appendSignature(sanitizedBody, settings.signature, true);
+
+	// Deterministic anti-hallucination check before sending (`TOP 6`)
+	if (!params.confirmedByHuman) {
+		const dossier = await fetchClientDossier(env, params.to);
+		const detCheck = verifyDraftDeterministically(signedBody, { dossier });
+		if (!detCheck.ok) {
+			return {
+				error: `REJECTED_NUMBER_MISMATCH: El correo contiene datos financieros o enlaces que no coinciden con el dossier oficial: ${detCheck.mismatches.map((m) => m.reason).join(" | ")}`,
+			};
+		}
 	}
+
 	const quotedBlock = buildQuotedReplyBlock({
 		date: originalEmail.date,
 		sender: originalEmail.sender || params.to,
 		body: originalEmail.body ?? undefined,
 	});
-	const fullBodyHtml = sanitizedBody + quotedBlock;
+	const fullBodyHtml = signedBody + quotedBlock;
+	const fromField = resolveOutboundFrom(mailboxId, mailboxId, settings);
 
+	let wireMessageId = outgoingMessageId;
+	let provider = "cf_email";
 	try {
-		await sendEmail(env.EMAIL, {
+		const sendRes = await sendOutboundEmail(env, {
 			to: params.to,
-			from: mailboxId,
+			from: fromField,
 			subject: params.subject,
 			html: fullBodyHtml,
-			headers: buildThreadingHeaders(originalMsgId, references),
+			headers: buildOutboundHeaders(outgoingMessageId, {
+				inReplyTo: originalMsgId,
+				references,
+			}),
 		});
+		wireMessageId = sendRes.wireMessageId || outgoingMessageId;
+		provider = sendRes.provider;
 	} catch (e) {
 		console.error("Email send failed:", (e as Error).message);
 		return { error: `Failed to send reply: ${(e as Error).message}` };
@@ -459,15 +512,20 @@ export async function toolSendReply(
 			email_references:
 				references.length > 0 ? JSON.stringify(references) : null,
 			thread_id: threadId,
-			message_id: outgoingMessageId,
+			message_id: wireMessageId,
 		},
 		[],
 	);
 
-	return { status: "sent", messageId, message: `Reply sent to ${params.to}` };
+	return {
+		status: "sent",
+		messageId,
+		provider,
+		message: `Reply sent to ${params.to} via ${provider}`,
+	};
 }
 
-// ── send_email ─────────────────────────────────────────────────────
+// ── send_email (with fromName, signature, Message-ID & Governance) ─
 
 export async function toolSendEmail(
 	env: Env,
@@ -476,14 +534,26 @@ export async function toolSendEmail(
 		to: string;
 		subject: string;
 		bodyHtml: string;
+		confirmedByHuman?: boolean;
 	},
 ): Promise<
-	| { status: "sent"; messageId: string; message: string }
+	| { status: "sent"; messageId: string; provider: string; message: string }
 	| { error: string }
 > {
 	const stub = getMailboxStub(env, mailboxId);
+	const settings = await getMailboxSettings(env.BUCKET, mailboxId);
 
-	// Check send rate limit
+	// Persona Governance (`Pablo` vs `Antonio` — TOP 6)
+	const governance = checkPersonaGovernance({
+		mailboxId,
+		settings,
+		body: params.bodyHtml,
+		confirmedByHuman: params.confirmedByHuman,
+	});
+	if (!governance.allowed) {
+		return { error: governance.error! };
+	}
+
 	const rateLimitError = await (stub as unknown as RateLimitStub).checkSendRateLimit();
 	if (rateLimitError) {
 		return { error: rateLimitError };
@@ -493,18 +563,33 @@ export async function toolSendEmail(
 	if (!fromDomain) throw new Error("Invalid mailbox email address");
 	const { messageId, outgoingMessageId } = generateMessageId(fromDomain);
 
-	const sanitizedBody = await verifyDraft(env.AI, params.bodyHtml);
-	if (!sanitizedBody) {
-		return { error: "Draft verification failed — refusing to send unverified content. Please try again." };
+	const sanitizedBody = (await verifyDraft(env.AI, params.bodyHtml)) || params.bodyHtml;
+	const signedBody = appendSignature(sanitizedBody, settings.signature, true);
+
+	if (!params.confirmedByHuman) {
+		const dossier = await fetchClientDossier(env, params.to);
+		const detCheck = verifyDraftDeterministically(signedBody, { dossier });
+		if (!detCheck.ok) {
+			return {
+				error: `REJECTED_NUMBER_MISMATCH: El correo contiene datos financieros o enlaces que no coinciden con el dossier oficial: ${detCheck.mismatches.map((m) => m.reason).join(" | ")}`,
+			};
+		}
 	}
 
+	const fromField = resolveOutboundFrom(mailboxId, mailboxId, settings);
+
+	let wireMessageId = outgoingMessageId;
+	let provider = "cf_email";
 	try {
-		await sendEmail(env.EMAIL, {
+		const sendRes = await sendOutboundEmail(env, {
 			to: params.to,
-			from: mailboxId,
+			from: fromField,
 			subject: params.subject,
-			html: sanitizedBody,
+			html: signedBody,
+			headers: buildOutboundHeaders(outgoingMessageId),
 		});
+		wireMessageId = sendRes.wireMessageId || outgoingMessageId;
+		provider = sendRes.provider;
 	} catch (e) {
 		console.error("Email send failed:", (e as Error).message);
 		return { error: `Failed to send email: ${(e as Error).message}` };
@@ -518,14 +603,19 @@ export async function toolSendEmail(
 			sender: mailboxId.toLowerCase(),
 			recipient: params.to.toLowerCase(),
 			date: new Date().toISOString(),
-			body: sanitizedBody,
+			body: signedBody,
 			in_reply_to: null,
 			email_references: null,
 			thread_id: messageId,
-			message_id: outgoingMessageId,
+			message_id: wireMessageId,
 		},
 		[],
 	);
 
-	return { status: "sent", messageId, message: `Email sent to ${params.to}` };
+	return {
+		status: "sent",
+		messageId,
+		provider,
+		message: `Email sent to ${params.to} via ${provider}`,
+	};
 }

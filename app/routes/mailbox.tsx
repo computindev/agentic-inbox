@@ -5,7 +5,6 @@
 import { useEffect, useRef } from "react";
 import { Outlet, useParams } from "react-router";
 import AgentSidebar from "~/components/AgentSidebar";
-import ComposeEmail from "~/components/ComposeEmail";
 import Header from "~/components/Header";
 import Sidebar from "~/components/Sidebar";
 import { useMailbox } from "~/queries/mailboxes";
@@ -21,7 +20,6 @@ export default function MailboxRoute() {
 		closeSidebar,
 		isAgentPanelOpen,
 		closePanel,
-		closeComposeModal,
 	} = useUIStore();
 
 	useEffect(() => {
@@ -31,12 +29,11 @@ export default function MailboxRoute() {
 			prevMailboxIdRef.current !== mailboxId
 		) {
 			closePanel();
-			closeComposeModal();
 			closeSidebar();
 		}
 
 		prevMailboxIdRef.current = mailboxId;
-	}, [mailboxId, closeComposeModal, closePanel, closeSidebar]);
+	}, [mailboxId, closePanel, closeSidebar]);
 
 	return (
 		<div className="flex h-screen overflow-hidden">
@@ -75,8 +72,6 @@ export default function MailboxRoute() {
 					<AgentSidebar />
 				</div>
 			)}
-
-			<ComposeEmail />
 		</div>
 	);
 }

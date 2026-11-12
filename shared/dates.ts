@@ -94,13 +94,12 @@ export function formatQuotedDate(dateStr: string | undefined): string {
 	const date = safeParse(dateStr);
 	if (!date) return dateStr;
 
-	return date.toLocaleString("en-US", {
+	return date.toLocaleString("es-CL", {
 		weekday: "short",
-		month: "short",
 		day: "numeric",
+		month: "short",
 		year: "numeric",
-		hour: "numeric",
+		hour: "2-digit",
 		minute: "2-digit",
-		hour12: true,
 	});
 }

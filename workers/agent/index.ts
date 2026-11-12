@@ -12,11 +12,23 @@ import {
 import { createWorkersAI } from "workers-ai-provider";
 import { z } from "zod";
 import type { EmailFull, EmailMetadata } from "../lib/schemas";
-import { verifyDraft, isPromptInjection } from "../lib/ai";
+import {
+	verifyDraft,
+	verifyDraftDeterministically,
+	isPromptInjection,
+} from "../lib/ai";
+import {
+	PABLO_DEFAULT_SYSTEM_PROMPT,
+	fetchClientDossier,
+	notifyPaymentClaim,
+	formatDossierForPrompt,
+} from "../lib/cobrador-bridge";
 import {
 	getMailboxStub,
+	getMailboxSettings,
 	stripHtmlToText,
 	textToHtml,
+	appendSignature,
 } from "../lib/email-helpers";
 import {
 	toolListEmails,
@@ -29,11 +41,15 @@ import {
 	toolMoveEmail,
 	toolDiscardDraft,
 } from "../lib/tools";
-import { Folders, FOLDER_TOOL_DESCRIPTION, MOVE_FOLDER_TOOL_DESCRIPTION } from "../../shared/folders";
-import type { Env } from "../types";
+import {
+	Folders,
+	FOLDER_TOOL_DESCRIPTION,
+	MOVE_FOLDER_TOOL_DESCRIPTION,
+} from "../../shared/folders";
+import type { Env, MailboxSettingsRecord } from "../types";
 
-// AI SDK v6 changed tool() overloads significantly. We define tools as plain
-// objects matching the Tool type to avoid overload resolution issues.
+export const DEFAULT_LLM_MODEL = "@cf/moonshotai/kimi-k2.5";
+
 function defineTool(def: {
 	description: string;
 	parameters: z.ZodType<any>;
@@ -47,64 +63,72 @@ function defineTool(def: {
 }
 
 /**
- * Default system prompt used when no custom prompt is configured for a mailbox.
- * Users can override this on a per-mailbox basis via the Settings UI.
+ * Generic fallback system prompt for non-Computin mailboxes when no custom prompt is set.
  */
-const DEFAULT_SYSTEM_PROMPT = `You are an email assistant that helps manage this inbox. You read emails, draft replies, and help organize conversations.
+const GENERIC_DEFAULT_SYSTEM_PROMPT = `You are an email assistant that helps manage this inbox. You read emails, draft replies, and help organize conversations.
 
 ## Writing Style
 Write like a real person. Short, direct, flowing prose. Get to the point. Plain text only - no HTML tags in your replies.
 
-**Formatting rules:**
-- Write in natural paragraphs. NO bullet points, NO numbered lists, NO dashes, NO markdown formatting in email drafts.
-- NO bold (**), NO italic (*), NO headers (#), NO horizontal rules (---), NO code blocks. Plain text only.
-- Links go inline in the text, not on separate lines.
-- Don't structure replies like a template or form letter. Just talk normally.
-
 **Agent Behavior Rules (CRITICAL):**
-- NEVER output meta-commentary about what you are doing (e.g. do not say "I am drafting a reply to Alex", "I checked the thread", etc).
+- NEVER output meta-commentary about what you are doing (e.g. do not say "I am drafting a reply", "I checked the thread", etc).
 - When a new email arrives, your ONLY job is to call the \`draft_reply\` tool.
-- DO NOT summarize the email. DO NOT explain your actions.
-- Output NOTHING except the tool call. If you must output text, it should ONLY be the literal draft text itself if tools fail.
 - Before drafting ANY reply, carefully read the full thread history.
-- NEVER repeat information that was already shared in a prior message in the thread.
-- Your reply should only contain NEW information or directly respond to what the person just said. Move the conversation forward, don't rehash it.
+- You can ONLY draft emails (\`draft_reply\` / \`draft_email\`). You do NOT have the ability to send emails directly.`;
 
-## Who Are You Replying To?
-Use the name the person gives in their email body / signature. That's their name - use it. The "from" address is where you send the reply, but the name in the email is how you greet them.
+const ANTONIO_PERSONA_ADDENDUM = `
 
-## CRITICAL: Draft Only - Never Send
-You can ONLY draft emails. You do NOT have the ability to send emails directly.
+## REGLA DE GOBERNANZA — PERSONA ANTONIO CORREA (ESTRICTO)
+Esta casilla opera bajo la identidad de **Antonio Correa**. Todo correo queda ESTRICTAMENTE en Borradores (Drafts) para revisión y confirmación explícita de Antonio. Escribe en primera persona singular ("te comento", "revisé"), tono directo chileno, sobrio y técnico, sin jamás inventar montos ni condiciones comerciales.`;
 
-- Use draft_reply to draft replies to existing emails
-- Use draft_email to draft new outbound emails
-- The operator will review and send drafts from the UI - you cannot send them
-
-**CRITICAL: The draft body must contain ONLY the email text.** Never include agent commentary, status messages, meta-notes, markdown formatting, or anything that isn't part of the actual email in the draft body. No "Draft created.", no "---", no "**bold**", no "Here's the draft:", no separators. The body field is the literal email the recipient will read. Everything else goes in your chat message, not in the draft body.
-
-**Don't paste draft contents into the chat.** The drafts are saved via tools - the operator can see them in the Drafts folder. In your chat message, just briefly say what you drafted (e.g. "Drafted a reply to Tim"). Don't duplicate the full email body in the chat.
-
-## Draft Management
-Use discard_draft to delete drafts that the operator rejects or that are no longer needed.`;
+function shouldUsePabloPromptByDefault(
+	mailboxId: string,
+	settings: MailboxSettingsRecord,
+): boolean {
+	if (settings.persona === "pablo") return true;
+	const lower = mailboxId.toLowerCase().trim();
+	return (
+		lower.startsWith("pablo@") ||
+		lower.startsWith("cobranza@") ||
+		lower.startsWith("pagos@") ||
+		lower.endsWith("@computin.dev") ||
+		lower.endsWith("@computincloudhosting.com")
+	);
+}
 
 /**
- * Fetch the custom system prompt for a mailbox from its R2 settings.
- * Falls back to DEFAULT_SYSTEM_PROMPT if none is configured.
+ * Resolve the effective system prompt and LLM model for a mailbox from R2 settings.
  */
-async function getSystemPrompt(env: Env, mailboxId: string): Promise<string> {
-	try {
-		const key = `mailboxes/${mailboxId}.json`;
-		const obj = await env.BUCKET.get(key);
-		if (obj) {
-			const settings = await obj.json<Record<string, unknown>>();
-			if (typeof settings.agentSystemPrompt === "string" && settings.agentSystemPrompt.trim()) {
-				return settings.agentSystemPrompt;
-			}
-		}
-	} catch {
-		// Fall through to default
+async function resolveAgentConfig(
+	env: Env,
+	mailboxId: string,
+): Promise<{
+	systemPrompt: string;
+	llmModel: string;
+	autoDraftEnabled: boolean;
+	settings: MailboxSettingsRecord;
+}> {
+	const settings = await getMailboxSettings(env.BUCKET, mailboxId);
+	const llmModel = settings.llmModel?.trim() || DEFAULT_LLM_MODEL;
+	const autoDraftEnabled = settings.autoDraftEnabled !== false;
+
+	let systemPrompt: string;
+	if (typeof settings.agentSystemPrompt === "string" && settings.agentSystemPrompt.trim()) {
+		systemPrompt = settings.agentSystemPrompt.trim();
+	} else if (shouldUsePabloPromptByDefault(mailboxId, settings)) {
+		systemPrompt = PABLO_DEFAULT_SYSTEM_PROMPT;
+	} else {
+		systemPrompt = GENERIC_DEFAULT_SYSTEM_PROMPT;
 	}
-	return DEFAULT_SYSTEM_PROMPT;
+
+	if (
+		settings.persona === "antonio" ||
+		mailboxId.toLowerCase().trim().startsWith("antonio@")
+	) {
+		systemPrompt += ANTONIO_PERSONA_ADDENDUM;
+	}
+
+	return { systemPrompt, llmModel, autoDraftEnabled, settings };
 }
 
 function createEmailTools(env: Env, mailboxId: string) {
@@ -144,7 +168,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 
 		get_thread: defineTool({
 			description:
-				"Get all emails in a conversation thread. This is essential for understanding the full context of a conversation before drafting a response. Returns all messages sorted chronologically.",
+				"Get all emails in a conversation thread. Returns all messages sorted chronologically.",
 			parameters: z.object({
 				threadId: z
 					.string()
@@ -159,13 +183,11 @@ function createEmailTools(env: Env, mailboxId: string) {
 
 		search_emails: defineTool({
 			description:
-				"Search for emails matching a query across subject and body fields.",
+				"Search for emails matching a query (supports operators like from:, to:, subject:, is:unread, has:attachment).",
 			parameters: z.object({
 				query: z
 					.string()
-					.describe(
-						"Search query to match against subject and body",
-					),
+					.describe("Search query to match against subject, body, and operators"),
 				folder: z
 					.string()
 					.optional()
@@ -176,19 +198,52 @@ function createEmailTools(env: Env, mailboxId: string) {
 			},
 		}),
 
+		get_client_dossier: defineTool({
+			description:
+				"Consulta la Ficha Cliente Computin (Customer 360) en cobrador-hosting por email o ID de cliente: plan, monto UF/CLP exacto de hoy, vencimiento, estado del ciclo, RUT y link oficial de pago /p/:token.",
+			parameters: z.object({
+				email: z
+					.string()
+					.describe("Correo electrónico del cliente o slug/ID en cobrador-hosting"),
+			}),
+			execute: async ({ email }): Promise<unknown> => {
+				return fetchClientDossier(env, email);
+			},
+		}),
+
+		register_payment_claim: defineTool({
+			description:
+				"Registra un aviso de transferencia/pago en cobrador-hosting para pausar inmediatamente los recordatorios de cobro del ciclo activo mientras se verifica en el banco.",
+			parameters: z.object({
+				email: z.string().optional().describe("Correo electrónico del cliente"),
+				cycleId: z.string().optional().describe("ID del ciclo si se conoce"),
+				amountClp: z.number().optional().describe("Monto en pesos chilenos ($ CLP) informado"),
+				rut: z.string().optional().describe("RUT de origen o del cliente"),
+				glosa: z.string().optional().describe("Glosa o referencia bancaria"),
+				note: z.string().optional().describe("Nota resumen del aviso de pago"),
+			}),
+			execute: async ({ email, cycleId, amountClp, rut, glosa, note }): Promise<unknown> => {
+				return notifyPaymentClaim(env, {
+					email,
+					cycleId,
+					amountClp,
+					rut,
+					glosa,
+					source: "email_agent",
+					note,
+				});
+			},
+		}),
+
 		draft_email: defineTool({
 			description:
-				"Draft a new email (not a reply) and save it to the Drafts folder. This does NOT send — it saves a draft for the operator to review. Use this for composing new outbound emails. Write the body as plain text — no HTML tags.",
+				"Draft a new email (not a reply) and save it to the Drafts folder. Does NOT send — saves a draft for operator review. Write the body as plain text — no HTML tags.",
 			parameters: z.object({
 				to: z.string().email().describe("Recipient email address"),
-				subject: z
-					.string()
-					.describe("Subject line"),
+				subject: z.string().describe("Subject line"),
 				body: z
 					.string()
-					.describe(
-						"The plain text body of the email. No HTML — just write normally.",
-					),
+					.describe("The plain text body of the email. No HTML — write normally."),
 			}),
 			execute: async ({ to, subject, body }): Promise<unknown> => {
 				return toolDraftEmail(env, mailboxId, {
@@ -196,13 +251,14 @@ function createEmailTools(env: Env, mailboxId: string) {
 					subject,
 					body,
 					isPlainText: true,
+					runVerifyDraft: true,
 				});
 			},
 		}),
 
 		draft_reply: defineTool({
 			description:
-				"Draft a reply to an existing email and save it to the Drafts folder. This does NOT send — it saves a draft for the operator to review and send from the UI. Write the body as plain text — no HTML tags.",
+				"Draft a reply to an existing email and save it to the Drafts folder. Does NOT send — saves a draft for operator review. Write the body as plain text — no HTML tags.",
 			parameters: z.object({
 				originalEmailId: z
 					.string()
@@ -213,9 +269,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 					.describe("Subject line (usually 'Re: ...')"),
 				body: z
 					.string()
-					.describe(
-						"The plain text body of the reply. No HTML — just write normally.",
-					),
+					.describe("The plain text body of the reply. No HTML — write normally."),
 			}),
 			execute: async ({ originalEmailId, to, subject, body }): Promise<unknown> => {
 				return toolDraftReply(env, mailboxId, {
@@ -258,7 +312,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 
 		discard_draft: defineTool({
 			description:
-				"Delete a draft email. Use this to discard drafts that are no longer needed or were rejected by the operator.",
+				"Delete a draft email that is no longer needed or was rejected by the operator.",
 			parameters: z.object({
 				draftId: z.string().describe("The ID of the draft to delete"),
 			}),
@@ -269,19 +323,16 @@ function createEmailTools(env: Env, mailboxId: string) {
 	};
 }
 
-// Use `any` for the Env generic to avoid type conflicts between the custom
-// SEND_EMAIL binding shape and the AIChatAgent constraint.  The actual env
-// is fully typed inside the tools via the closure.
 export class EmailAgent extends AIChatAgent<any> {
 	async onChatMessage(onFinish: any) {
 		const env = this.env as Env;
 		const mailboxId = this.name;
 		const workersai = createWorkersAI({ binding: env.AI });
 		const tools = createEmailTools(env, mailboxId);
-		const systemPrompt = await getSystemPrompt(env, mailboxId);
+		const { systemPrompt, llmModel } = await resolveAgentConfig(env, mailboxId);
 
 		const result = streamText({
-			model: workersai("@cf/moonshotai/kimi-k2.5"),
+			model: workersai(llmModel as any),
 			system: systemPrompt,
 			messages: await convertToModelMessages(this.messages),
 			tools,
@@ -292,15 +343,11 @@ export class EmailAgent extends AIChatAgent<any> {
 		return result.toUIMessageStreamResponse();
 	}
 
-	/**
-	 * Handle HTTP requests to the agent DO. Intercepts /onNewEmail
-	 * before passing to the default AIChatAgent handler.
-	 */
 	async onRequest(request: Request): Promise<Response> {
 		const url = new URL(request.url);
 		if (url.pathname === "/onNewEmail" && request.method === "POST") {
 			try {
-				const emailData = await request.json() as {
+				const emailData = (await request.json()) as {
 					mailboxId: string;
 					emailId: string;
 					sender: string;
@@ -322,10 +369,6 @@ export class EmailAgent extends AIChatAgent<any> {
 		return super.onRequest(request);
 	}
 
-	/**
-	 * Called when a new email arrives. Reads it, loads the thread,
-	 * drafts a response, and saves it to the Drafts folder.
-	 */
 	async handleNewEmail(emailData: {
 		mailboxId: string;
 		emailId: string;
@@ -334,12 +377,15 @@ export class EmailAgent extends AIChatAgent<any> {
 		threadId: string;
 	}) {
 		const env = this.env as Env;
+		const { systemPrompt, llmModel, autoDraftEnabled, settings } =
+			await resolveAgentConfig(env, emailData.mailboxId);
+
+		if (!autoDraftEnabled) {
+			return { status: "skipped_auto_draft_disabled" };
+		}
+
 		const workersai = createWorkersAI({ binding: env.AI });
 		const tools = createEmailTools(env, emailData.mailboxId);
-		const systemPrompt = await getSystemPrompt(env, emailData.mailboxId);
-
-		// Pre-read the email and thread so the agent has full context
-		// without needing to waste tool calls discovering it
 		const stub = getMailboxStub(env, emailData.mailboxId);
 
 		let emailBody = "";
@@ -349,109 +395,142 @@ export class EmailAgent extends AIChatAgent<any> {
 			if (email?.body) {
 				const isInjection = await isPromptInjection(env.AI, email.body);
 				if (isInjection) {
-					console.warn("Skipping auto-draft due to detected prompt injection:", emailData.emailId);
-					
-					// Log to agent chat so the user knows why it skipped
+					console.warn(
+						"Skipping auto-draft due to detected prompt injection:",
+						emailData.emailId,
+					);
 					const newMessages = [
 						{
 							id: crypto.randomUUID(),
 							role: "user" as const,
-							content: `[Auto-triggered] New email from ${emailData.sender}: "${emailData.subject}"`,
+							content: `[Auto-triggered] Nuevo correo de ${emailData.sender}: "${emailData.subject}"`,
 							createdAt: new Date(),
-							parts: [{ type: "text" as const, text: `[Auto-triggered] New email from ${emailData.sender}: "${emailData.subject}"` }],
+							parts: [
+								{
+									type: "text" as const,
+									text: `[Auto-triggered] Nuevo correo de ${emailData.sender}: "${emailData.subject}"`,
+								},
+							],
 						},
 						{
 							id: crypto.randomUUID(),
 							role: "assistant" as const,
-							content: "⚠️ Blocked auto-draft creation: the email appears to contain prompt injection or malicious instructions.",
+							content:
+								"⚠️ Auto-redacción bloqueada: se detectaron posibles instrucciones de prompt injection en el correo entrante.",
 							createdAt: new Date(),
-							parts: [{ type: "text" as const, text: "⚠️ Blocked auto-draft creation: the email appears to contain prompt injection or malicious instructions." }],
+							parts: [
+								{
+									type: "text" as const,
+									text: "⚠️ Auto-redacción bloqueada: se detectaron posibles instrucciones de prompt injection en el correo entrante.",
+								},
+							],
 						},
 					];
 					await this.persistMessages([...this.messages, ...newMessages]);
-					
-					return;
+					return { status: "blocked_prompt_injection" };
 				}
-				
+
 				emailBody = stripHtmlToText(email.body);
 			}
 
-		// Load thread for conversation context
-		const threadEmails = (await stub.getEmails({ thread_id: emailData.threadId })) as EmailMetadata[];
-		if (threadEmails.length > 1) {
-			const fullThread = await Promise.all(
-				threadEmails.map(async (e) => {
-					const full = (await stub.getEmail(e.id)) as EmailFull | null;
-					const text = full?.body ? stripHtmlToText(full.body) : "";
-					return { id: e.id, sender: e.sender, recipient: e.recipient, subject: e.subject, date: e.date, folder_id: e.folder_id, body_text: text };
-				}),
-			);
-			fullThread.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-			threadContext = fullThread
-				.map((e) => `[${e.date}] ${e.sender} → ${e.recipient} (${e.folder_id}): ${e.body_text.substring(0, 500)}`)
-				.join("\n\n");
+			const threadEmails = (await stub.getEmails({
+				thread_id: emailData.threadId,
+			})) as EmailMetadata[];
+			if (threadEmails.length > 1) {
+				const fullThread = await Promise.all(
+					threadEmails.map(async (e) => {
+						const full = (await stub.getEmail(e.id)) as EmailFull | null;
+						const text = full?.body ? stripHtmlToText(full.body) : "";
+						return {
+							id: e.id,
+							sender: e.sender,
+							recipient: e.recipient,
+							subject: e.subject,
+							date: e.date,
+							folder_id: e.folder_id,
+							body_text: text,
+						};
+					}),
+				);
+				fullThread.sort(
+					(a, b) => new Date(a.date).getTime() - new Date(b.date).getTime(),
+				);
+				threadContext = fullThread
+					.map(
+						(e) =>
+							`[${e.date}] ${e.sender} → ${e.recipient} (${e.folder_id}): ${e.body_text.substring(0, 500)}`,
+					)
+					.join("\n\n");
 
-			// Scan thread context for prompt injection too -- an attacker
-			// could plant an injection in an earlier email in the thread
-			// that gets included in the agent's prompt.
-			if (threadContext) {
-				const threadInjection = await isPromptInjection(env.AI, threadContext);
-				if (threadInjection) {
-					console.warn("Skipping auto-draft due to prompt injection in thread context:", emailData.threadId);
-					const newMessages = [
-						{
-							id: crypto.randomUUID(),
-							role: "user" as const,
-							content: `[Auto-triggered] New email from ${emailData.sender}: "${emailData.subject}"`,
-							createdAt: new Date(),
-							parts: [{ type: "text" as const, text: `[Auto-triggered] New email from ${emailData.sender}: "${emailData.subject}"` }],
-						},
-						{
-							id: crypto.randomUUID(),
-							role: "assistant" as const,
-							content: "Blocked auto-draft creation: the thread context appears to contain prompt injection or malicious instructions.",
-							createdAt: new Date(),
-							parts: [{ type: "text" as const, text: "Blocked auto-draft creation: the thread context appears to contain prompt injection or malicious instructions." }],
-						},
-					];
-					await this.persistMessages([...this.messages, ...newMessages]);
-					return;
+				if (threadContext) {
+					const threadInjection = await isPromptInjection(env.AI, threadContext);
+					if (threadInjection) {
+						console.warn(
+							"Skipping auto-draft due to prompt injection in thread context:",
+							emailData.threadId,
+						);
+						const newMessages = [
+							{
+								id: crypto.randomUUID(),
+								role: "user" as const,
+								content: `[Auto-triggered] Nuevo correo de ${emailData.sender}: "${emailData.subject}"`,
+								createdAt: new Date(),
+								parts: [
+									{
+										type: "text" as const,
+										text: `[Auto-triggered] Nuevo correo de ${emailData.sender}: "${emailData.subject}"`,
+									},
+								],
+							},
+							{
+								id: crypto.randomUUID(),
+								role: "assistant" as const,
+								content:
+									"⚠️ Auto-redacción bloqueada: el historial del hilo contiene señales de prompt injection.",
+								createdAt: new Date(),
+								parts: [
+									{
+										type: "text" as const,
+										text: "⚠️ Auto-redacción bloqueada: el historial del hilo contiene señales de prompt injection.",
+									},
+								],
+							},
+						];
+						await this.persistMessages([...this.messages, ...newMessages]);
+						return { status: "blocked_prompt_injection" };
+					}
 				}
 			}
-		}
 		} catch (e) {
 			console.warn("Pre-read failed, agent will use tools:", (e as Error).message);
 		}
 
-		let autoPrompt = `A new email just arrived. Draft an appropriate response using draft_reply.
+		// Fetch live Customer 360 Dossier from `cobrador-hosting` (`TOP 3`)
+		const dossier = await fetchClientDossier(env, emailData.sender);
+		const dossierSection = formatDossierForPrompt(dossier);
 
-Email details:
-- Mailbox: ${emailData.mailboxId}
+		let autoPrompt = `Acaba de llegar un nuevo correo. Redacta una respuesta apropiada guardándola en Borradores mediante \`draft_reply\`. Si el cliente informa que ya transfirió o pagó, llama primero a \`register_payment_claim\` y luego a \`draft_reply\`.
+
+Detalles del correo:
+- Casilla: ${emailData.mailboxId}
 - Email ID: ${emailData.emailId}
-- From: ${emailData.sender}
-- Subject: ${emailData.subject}
+- De: ${emailData.sender}
+- Asunto: ${emailData.subject}
 - Thread ID: ${emailData.threadId}
 
-Email body:
-${emailBody || "(could not pre-read — use get_email to read it)"}`;
+${dossierSection}
+
+Cuerpo del correo recibido:
+${emailBody || "(no se pudo pre-leer — usa get_email si necesitas leerlo)"}`;
 
 		if (threadContext) {
-			autoPrompt += `
-
-Full thread history (${emailData.threadId}):
-${threadContext}`;
+			autoPrompt += `\n\nHistorial completo del hilo (${emailData.threadId}):\n${threadContext}`;
 		} else {
-			autoPrompt += `
-
-This is the first message in the thread (no prior conversation).`;
+			autoPrompt += `\n\nEste es el primer mensaje en el hilo.`;
 		}
 
-		autoPrompt += `
+		autoPrompt += `\n\nRecuerda: NUNCA inventes montos, UF, RUTs, cuentas bancarias ni enlaces /p/... que no estén en la Ficha Cliente Computin.`;
 
-Based on the email content and thread context above, draft a reply using draft_reply. If you need more context, use get_thread with thread ID "${emailData.threadId}".`;
-
-		// Fresh context for auto-draft -- don't include prior chat history
-		// to avoid confusing the model with old messages and tool calls
 		const messages = [
 			{
 				role: "user" as const,
@@ -463,25 +542,30 @@ Based on the email content and thread context above, draft a reply using draft_r
 
 		try {
 			const result = await generateText({
-				model: workersai("@cf/moonshotai/kimi-k2.5"),
+				model: workersai(llmModel as any),
 				system: systemPrompt,
 				messages: await convertToModelMessages(messages),
 				tools,
 				stopWhen: stepCountIs(5),
 			});
 
-			// Check if draft_reply was called (saves to Drafts as side effect).
-			// If NOT, save the agent's text response as a draft directly.
 			const draftToolCalled = result.steps.some((step) =>
-				step.toolCalls.some((tc) => tc.toolName === "draft_reply" || tc.toolName === "draft_email"),
+				step.toolCalls.some(
+					(tc) => tc.toolName === "draft_reply" || tc.toolName === "draft_email",
+				),
 			);
 
+			let detWarningNote = "";
+
 			if (!draftToolCalled && result.text.trim()) {
-				// Model generated a draft inline as text -- verify with AI
 				const sanitizedText = await verifyDraft(env.AI, result.text.trim());
-				if (!sanitizedText) {
-					// Inline text was entirely agent commentary, skip
-				} else {
+				if (sanitizedText) {
+					const withSig = appendSignature(sanitizedText, settings.signature, false);
+					const detCheck = verifyDraftDeterministically(withSig, { dossier });
+					if (!detCheck.ok) {
+						detWarningNote = ` (⚠️ Revisión requerida: ${detCheck.mismatches.map((m) => m.reason).join("; ")})`;
+					}
+
 					const draftId = crypto.randomUUID();
 					const draftStub = getMailboxStub(env, emailData.mailboxId);
 					const reSubject = emailData.subject.startsWith("Re:")
@@ -495,38 +579,30 @@ Based on the email content and thread context above, draft a reply using draft_r
 							sender: emailData.mailboxId.toLowerCase(),
 							recipient: emailData.sender.toLowerCase(),
 							date: new Date().toISOString(),
-						// verifyDraft may return plain text or HTML depending on its
-						// code path. Only wrap in textToHtml if it's plain text.
-						body: /<[a-z][\s\S]*>/i.test(sanitizedText)
-							? sanitizedText
-							: textToHtml(sanitizedText),
-						in_reply_to: emailData.emailId,
+							body: /<[a-z][\s\S]*>/i.test(withSig) ? withSig : textToHtml(withSig),
+							in_reply_to: emailData.emailId,
 							email_references: null,
 							thread_id: emailData.threadId,
 						},
 						[],
 					);
-					// Inline text saved as draft
 				}
 			}
 
-			// Persist the conversation into the agent's chat history
-			// If it called the tool, we just log a simple success message so the chat isn't cluttered
-			// with conversational slop.
-			const assistantText = draftToolCalled 
-				? `Created draft reply to ${emailData.sender}.`
-				: result.text;
+			const assistantText = draftToolCalled
+				? `Borrador de respuesta creado para ${emailData.sender}${dossier.found && dossier.clientName ? ` (${dossier.clientName})` : ""}.`
+				: `${result.text}${detWarningNote}`;
 
 			const newMessages = [
 				{
 					id: crypto.randomUUID(),
 					role: "user" as const,
-					content: `[Auto-triggered] New email from ${emailData.sender}: "${emailData.subject}"`,
+					content: `[Auto-triggered] Nuevo correo de ${emailData.sender}: "${emailData.subject}"`,
 					createdAt: new Date(),
 					parts: [
 						{
 							type: "text" as const,
-							text: `[Auto-triggered] New email from ${emailData.sender}: "${emailData.subject}"`,
+							text: `[Auto-triggered] Nuevo correo de ${emailData.sender}: "${emailData.subject}"`,
 						},
 					],
 				},
@@ -546,7 +622,7 @@ Based on the email content and thread context above, draft a reply using draft_r
 
 			await this.persistMessages([...this.messages, ...newMessages]);
 
-			return { status: "draft_generated", text: result.text };
+			return { status: "draft_generated", text: assistantText };
 		} catch (e) {
 			console.error("Auto-draft failed:", (e as Error).message);
 			return { status: "error", error: (e as Error).message };

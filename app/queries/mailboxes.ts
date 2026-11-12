@@ -59,3 +59,23 @@ export function useDeleteMailbox() {
 		},
 	});
 }
+
+export function useMigrateMailbox() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			mailboxId,
+			newEmail,
+			keepOldAsAlias,
+		}: {
+			mailboxId: string;
+			newEmail: string;
+			keepOldAsAlias: boolean;
+		}) => api.migrateMailbox(mailboxId, { newEmail, keepOldAsAlias }),
+		onSuccess: (_data, { mailboxId, newEmail }) => {
+			qc.invalidateQueries({ queryKey: queryKeys.mailboxes.all });
+			qc.invalidateQueries({ queryKey: queryKeys.mailboxes.detail(mailboxId) });
+			qc.invalidateQueries({ queryKey: queryKeys.mailboxes.detail(newEmail) });
+		},
+	});
+}

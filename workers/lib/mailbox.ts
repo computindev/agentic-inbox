@@ -15,15 +15,16 @@ export type MailboxContext = {
 	Bindings: Env;
 	Variables: {
 		mailboxStub: DurableObjectStub<MailboxDO>;
+		authMethod?: "cf_access" | "agent_api_key" | "dev";
 	};
 };
 
 export const requireMailbox = createMiddleware<MailboxContext>(async (c, next) => {
 	const rawId = c.req.param("mailboxId");
 	if (!rawId) return c.json({ error: "Mailbox ID required" }, 400);
-	const mailboxId = decodeURIComponent(rawId);
+	const mailboxId = decodeURIComponent(rawId).toLowerCase().trim();
 
-	// Verify mailbox exists
+	// Verify mailbox exists in R2
 	const key = `mailboxes/${mailboxId}.json`;
 	const obj = await c.env.BUCKET.head(key);
 	if (!obj) {
@@ -36,6 +37,6 @@ export const requireMailbox = createMiddleware<MailboxContext>(async (c, next) =
 	const stub = ns.get(id);
 
 	c.set("mailboxStub", stub);
-	
+
 	await next();
 });

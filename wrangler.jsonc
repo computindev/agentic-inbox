@@ -1,6 +1,7 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "agentic-inbox",
+	"account_id": "f5add317537288f05184becfe4b87470",
 	"compatibility_date": "2025-11-28",
 	"main": "./workers/app.ts",
 	"observability": {
@@ -9,13 +10,29 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
+	"routes": [
+		{
+			"pattern": "inbox.computin.dev",
+			"custom_domain": true
+		}
+	],
 	"vars": {
 		// Production deploys must also define POLICY_AUD and TEAM_DOMAIN.
 		// TEAM_DOMAIN may be the base Access URL or the full /cdn-cgi/access/certs URL.
 		// The worker now fails closed outside local development if Access is not configured.
-		"DOMAINS": "example.com",
+		"DOMAINS": "computin.dev,computincloudhosting.com",
+		"TEAM_DOMAIN": "https://falling-sun-32f4.cloudflareaccess.com",
+		"POLICY_AUD": "c211317908f4ba6448280727e80791525cee5653a5dafb3d1ff68b0c1bbc3181",
+		"COBRADOR_URL": "https://cobro.computincloudhosting.com",
 		"EMAIL_ADDRESSES": []
 	},
+	"services": [
+		{
+			"binding": "COBRADOR",
+			"service": "cobrador-hosting",
+			"entrypoint": "CobradorRPC"
+		}
+	],
 	"send_email": [
 		{
 			"name": "EMAIL",

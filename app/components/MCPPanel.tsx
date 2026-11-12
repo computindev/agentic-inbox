@@ -52,17 +52,36 @@ const TOOLS = [
 	{ name: "get_thread", desc: "Load a conversation thread" },
 	{ name: "search_emails", desc: "Search emails by query" },
 	{ name: "draft_reply", desc: "Draft a reply to an email" },
+	{ name: "create_draft", desc: "Draft a new email" },
+	{ name: "update_draft", desc: "Update an existing draft" },
+	{ name: "delete_email", desc: "Delete an email or draft" },
 	{ name: "send_reply", desc: "Send a reply" },
 	{ name: "send_email", desc: "Send a new email" },
 	{ name: "mark_email_read", desc: "Mark email as read/unread" },
 	{ name: "move_email", desc: "Move email to a folder" },
+	{ name: "get_client_dossier", desc: "Customer 360 billing dossier" },
+	{ name: "register_payment_claim", desc: "Pause billing / log payment" },
 ];
 
 export default function MCPPanel() {
-	const { mailboxId } = useParams<{ mailboxId: string }>();
+	const { mailboxId: _mailboxId } = useParams<{ mailboxId: string }>();
 	const baseUrl =
-		typeof window !== "undefined" ? window.location.origin : "https://your-app.workers.dev";
+		typeof window !== "undefined" ? window.location.origin : "https://inbox.computin.dev";
 	const mcpUrl = `${baseUrl}/mcp`;
+	const mcpJson = JSON.stringify(
+		{
+			mcpServers: {
+				"computin-inbox": {
+					url: mcpUrl,
+					headers: {
+						Authorization: "Bearer <AGENT_API_KEY>",
+					},
+				},
+			},
+		},
+		null,
+		2,
+	);
 
 	return (
 		<div className="flex flex-col h-full">
@@ -108,6 +127,19 @@ export default function MCPPanel() {
 							{mcpUrl}
 						</div>
 					</div>
+				</div>
+
+				{/* MCP JSON Config */}
+				<div className="space-y-1.5">
+					<div className="flex items-center justify-between">
+						<label className="text-xs font-medium text-kumo-strong block">
+							MCP JSON Config (pi / Claude / Antigravity)
+						</label>
+						<CopyButton text={mcpJson} />
+					</div>
+					<pre className="bg-kumo-recessed text-kumo-subtle font-mono text-[10.5px] p-2.5 rounded-lg border border-kumo-line overflow-x-auto leading-relaxed">
+						{mcpJson}
+					</pre>
 				</div>
 
 				{/* Available tools */}

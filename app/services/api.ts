@@ -2,7 +2,17 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-import type { Email, Folder, Mailbox } from "~/types";
+import type {
+	ClientDossier,
+	Email,
+	Folder,
+	Mailbox,
+	MigrateMailboxResponse,
+	PaymentClaimInput,
+	PaymentClaimResponse,
+	PlatformConfig,
+	TestEmailResponse,
+} from "~/types";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -96,8 +106,14 @@ interface EmailListResponse {
 
 const api = {
 	// Config
-	getConfig: () =>
-		get<{ domains: string[]; emailAddresses: string[] }>("/api/v1/config"),
+	getConfig: () => get<PlatformConfig>("/api/v1/config"),
+	updateConfig: (config: Partial<PlatformConfig>) =>
+		put<PlatformConfig>("/api/v1/config", config),
+	sendTestEmail: (payload: {
+		from: string;
+		to: string;
+		outboundProvider?: PlatformConfig["outboundProvider"];
+	}) => post<TestEmailResponse>("/api/v1/config/test-email", payload),
 
 	// Mailboxes
 	listMailboxes: () => get<Mailbox[]>("/api/v1/mailboxes"),
@@ -107,8 +123,32 @@ const api = {
 		get<Mailbox>(`/api/v1/mailboxes/${mailboxId}`),
 	updateMailbox: (mailboxId: string, settings: unknown) =>
 		put<Mailbox>(`/api/v1/mailboxes/${mailboxId}`, { settings }),
+	migrateMailbox: (
+		mailboxId: string,
+		payload: { newEmail: string; keepOldAsAlias: boolean },
+	) =>
+		post<MigrateMailboxResponse>(
+			`/api/v1/mailboxes/${mailboxId}/migrate`,
+			payload,
+		),
 	deleteMailbox: (mailboxId: string) =>
 		del<void>(`/api/v1/mailboxes/${mailboxId}`),
+
+	// Cobrador Customer 360 Dossier & Payment Claims
+	getClientDossier: (
+		mailboxId: string,
+		email: string,
+		opts?: { signal?: AbortSignal },
+	) =>
+		get<ClientDossier>(`/api/v1/mailboxes/${mailboxId}/dossier`, {
+			params: { email },
+			signal: opts?.signal,
+		}),
+	claimPayment: (mailboxId: string, payload: PaymentClaimInput) =>
+		post<PaymentClaimResponse>(
+			`/api/v1/mailboxes/${mailboxId}/claim-payment`,
+			payload,
+		),
 
 	// Emails
 	listEmails: (mailboxId: string, params: Record<string, string>, opts?: { signal?: AbortSignal }) =>
