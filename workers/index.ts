@@ -2,6 +2,7 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
+import { getAgentByName } from "agents";
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import PostalMime from "postal-mime";
@@ -554,6 +555,9 @@ app.delete("/api/v1/mailboxes/:mailboxId", async (c) => {
 		for (let i = 0; i < r2Keys.length; i += 500) {
 			await c.env.BUCKET.delete(r2Keys.slice(i, i + 500));
 		}
+		if (typeof stub.purgeAllData === "function") {
+			await stub.purgeAllData();
+		}
 	} catch (e) {
 		console.warn("Mailbox attachment cleanup warning:", (e as Error).message);
 	}
@@ -1060,7 +1064,14 @@ async function receiveEmail(
 	const emailReferences = parsedEmail.references
 		? parsedEmail.references.split(/\s+/).filter(Boolean).map(extractMsgId)
 		: [];
-	let threadId = emailReferences[0] || inReplyTo || messageId;
+	const parentMessageIds = [
+		...new Set([...emailReferences, ...(inReplyTo ? [inReplyTo] : [])]),
+	];
+	const existingThread =
+		parentMessageIds.length > 0
+			? await (stub as any).findThreadByMessageIds(parentMessageIds)
+			: null;
+	let threadId = existingThread || emailReferences[0] || inReplyTo || messageId;
 
 	if (!inReplyTo && emailReferences.length === 0) {
 		const subjectThread = await (stub as any).findThreadBySubject(
@@ -1198,10 +1209,10 @@ async function receiveEmail(
 		return;
 	}
 
-	const agentStub = env.EMAIL_AGENT.get(env.EMAIL_AGENT.idFromName(mailboxId));
 	ctx.waitUntil(
-		agentStub
-			.fetch(
+		(async () => {
+			const agentStub = await getAgentByName(env.EMAIL_AGENT, mailboxId);
+			await agentStub.fetch(
 				new Request("https://agents/onNewEmail", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
@@ -1213,10 +1224,10 @@ async function receiveEmail(
 						threadId,
 					}),
 				}),
-			)
-			.catch((e) =>
-				console.error("Auto-draft trigger failed:", (e as Error).message),
-			),
+			);
+		})().catch((e) =>
+			console.error("Auto-draft trigger failed:", (e as Error).message),
+		),
 	);
 }
 

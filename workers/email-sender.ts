@@ -450,7 +450,10 @@ export async function sendEmail(
 
 		if (params.attachments && params.attachments.length > 0) {
 			message.attachments = params.attachments.map((att) => ({
-				content: att.content,
+				content:
+					typeof att.content === "string"
+						? Uint8Array.from(atob(att.content), (c) => c.charCodeAt(0))
+						: att.content,
 				filename: att.filename,
 				type: att.type,
 				disposition: att.disposition,

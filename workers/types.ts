@@ -59,8 +59,7 @@ export interface CobradorServiceBinding extends Fetcher {
 export interface Env extends Cloudflare.Env {
 	AGENT_API_KEY?: string;
 	INTERNAL_API_KEY?: string;
-	COBRADOR_URL?: string;
-	COBRADOR?: CobradorServiceBinding;
+	COBRADOR: Cloudflare.Env["COBRADOR"] & CobradorServiceBinding;
 	AWS_ACCESS_KEY_ID?: string;
 	AWS_SECRET_ACCESS_KEY?: string;
 	AWS_SESSION_TOKEN?: string;
