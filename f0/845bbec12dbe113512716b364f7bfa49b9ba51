@@ -1,0 +1,33 @@
+workers/durableObject/index.ts
+  s_19232fd1bea36d::t_fc57b78a36b5e3 742-760,865-891,993-996
+workers/durableObject/migrations.ts
+  s_19232fd1bea36d::t_a68c20c388af4f 171-174
+workers/email-sender.ts
+  s_19232fd1bea36d::t_06718075f95f24 453-456
+workers/index.ts
+  s_2919f6a32f6c60::t_cce0f207f95a5d 5,558-560,1067-1074,1213-1215,1227-1230
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f0845bbec12dbe113512716b364f7bfa49b9ba51",
+  "prompts": {},
+  "sessions": {
+    "s_19232fd1bea36d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "14f9f3d8-9a4a-4add-8301-24ae5ac28a17",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "Antonio Correa <antonio.correa@gmail.com>"
+    },
+    "s_2919f6a32f6c60": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f79a8cc2-9135-431e-8dc5-d983ee6d746b",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Antonio Correa <antonio.correa@gmail.com>"
+    }
+  }
+}
