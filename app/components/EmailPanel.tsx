@@ -118,6 +118,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 			const fromName = currentMailbox.settings?.fromName || currentMailbox.name;
 			const from = fromName && fromName !== currentMailbox.email ? { email: currentMailbox.email, name: fromName } : currentMailbox.email;
 			const originalEmail = target.in_reply_to ? allMessages.find((msg) => msg.id === target.in_reply_to) : undefined;
+			const replyTargetId = originalEmail?.id || target.in_reply_to;
 			const emailData = {
 				to: toEmailListValue(toRecipients),
 				cc: toEmailListValue(splitEmailList(target.cc)),
@@ -127,7 +128,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				html: target.body || "",
 				text: target.body ? target.body.replace(/<[^>]*>/g, "").trim() : "",
 			};
-			if (originalEmail) await replyMut.mutateAsync({ mailboxId, emailId: originalEmail.id, email: emailData }); else await sendEmailMut.mutateAsync({ mailboxId, email: emailData });
+			if (replyTargetId) await replyMut.mutateAsync({ mailboxId, emailId: replyTargetId, email: emailData }); else await sendEmailMut.mutateAsync({ mailboxId, email: emailData });
 			await deleteEmailMut.mutateAsync({ mailboxId, id: target.id });
 			toastManager.add({ title: "Email sent!" });
 			if (isDraftFolder) closePanel();

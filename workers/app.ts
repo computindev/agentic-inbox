@@ -6,7 +6,7 @@ import { routeAgentRequest } from "agents";
 import { Hono } from "hono";
 import { jwtVerify, createRemoteJWKSet } from "jose";
 import { createRequestHandler } from "react-router";
-import { app as apiApp, receiveEmail } from "./index";
+import { app as apiApp, receiveEmail, type InboundEmailEvent } from "./index";
 import { EmailMCP } from "./mcp";
 import type { Env } from "./types";
 
@@ -28,7 +28,11 @@ const requestHandler = createRequestHandler(
 	import.meta.env.MODE,
 );
 
-function getAccessUrls(teamDomain: string) {
+// Cache RemoteJWKSet instances per certsUrl so public keys are not refetched
+// on every HTTP request while jose handles cooldown-based key rotation.
+const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
+
+function getAccessVerifier(teamDomain: string) {
 	const certsPath = "/cdn-cgi/access/certs";
 	const teamUrl = new URL(teamDomain);
 	const issuer = teamUrl.origin;
@@ -36,7 +40,14 @@ function getAccessUrls(teamDomain: string) {
 		? teamUrl
 		: new URL(certsPath, issuer);
 
-	return { issuer, certsUrl };
+	const cacheKey = certsUrl.toString();
+	let jwks = jwksCache.get(cacheKey);
+	if (!jwks) {
+		jwks = createRemoteJWKSet(certsUrl);
+		jwksCache.set(cacheKey, jwks);
+	}
+
+	return { issuer, jwks };
 }
 
 // Main app that wraps the API and adds React Router fallback
@@ -65,9 +76,8 @@ app.use("*", async (c, next) => {
 	}
 
 	try {
-		const { issuer, certsUrl } = getAccessUrls(TEAM_DOMAIN);
-		const JWKS = createRemoteJWKSet(certsUrl);
-		await jwtVerify(token, JWKS, {
+		const { issuer, jwks } = getAccessVerifier(TEAM_DOMAIN);
+		await jwtVerify(token, jwks, {
 			issuer,
 			audience: POLICY_AUD,
 		});
@@ -111,7 +121,7 @@ app.all("*", (c) => {
 export default {
 	fetch: app.fetch,
 	async email(
-		event: { raw: ReadableStream; rawSize: number },
+		event: InboundEmailEvent,
 		env: Env,
 		ctx: ExecutionContext,
 	) {

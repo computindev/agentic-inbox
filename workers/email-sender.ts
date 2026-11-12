@@ -29,44 +29,88 @@ export interface SendEmailParams {
 	headers?: Record<string, string>;
 }
 
+function stripAngleBrackets(id: string): string {
+	return id.trim().replace(/^<+|>+$/g, "");
+}
+
 /**
  * Send an email using the Cloudflare Email Service binding.
  *
  * @param binding  - The `EMAIL` SendEmail binding from env
  * @param params   - Email parameters (to, from, subject, body, etc.)
- * @returns The send result with messageId
+ * @returns The send result with messageId and wireMessageId
  * @throws On validation or delivery errors (error has `.code` property)
  */
 export async function sendEmail(
 	binding: SendEmail,
 	params: SendEmailParams,
-): Promise<{ messageId: string }> {
-	const message: Record<string, unknown> = {
-		to: params.to,
-		from: params.from,
-		subject: params.subject,
+): Promise<{ messageId: string; wireMessageId: string }> {
+	const buildPayload = (headers?: Record<string, string>) => {
+		const message: Record<string, unknown> = {
+			to: params.to,
+			from: params.from,
+			subject: params.subject,
+		};
+
+		if (params.html) message.html = params.html;
+		if (params.text) message.text = params.text;
+		if (params.cc) message.cc = params.cc;
+		if (params.bcc) message.bcc = params.bcc;
+		if (params.replyTo) message.replyTo = params.replyTo;
+
+		if (headers && Object.keys(headers).length > 0) {
+			message.headers = headers;
+		}
+
+		if (params.attachments && params.attachments.length > 0) {
+			message.attachments = params.attachments.map((att) => ({
+				content: att.content,
+				filename: att.filename,
+				type: att.type,
+				disposition: att.disposition,
+				...(att.contentId ? { contentId: att.contentId } : {}),
+			}));
+		}
+
+		return message;
 	};
 
-	if (params.html) message.html = params.html;
-	if (params.text) message.text = params.text;
-	if (params.cc) message.cc = params.cc;
-	if (params.bcc) message.bcc = params.bcc;
-	if (params.replyTo) message.replyTo = params.replyTo;
-
-	if (params.headers && Object.keys(params.headers).length > 0) {
-		message.headers = params.headers;
+	let explicitMsgId = "";
+	if (params.headers) {
+		for (const [k, v] of Object.entries(params.headers)) {
+			if (k.toLowerCase() === "message-id" && v) {
+				explicitMsgId = stripAngleBrackets(v);
+				break;
+			}
+		}
 	}
 
-	if (params.attachments && params.attachments.length > 0) {
-		message.attachments = params.attachments.map((att) => ({
-			content: att.content,
-			filename: att.filename,
-			type: att.type,
-			disposition: att.disposition,
-			...(att.contentId ? { contentId: att.contentId } : {}),
-		}));
+	try {
+		const result = await binding.send(buildPayload(params.headers) as any);
+		const wireMessageId =
+			explicitMsgId || stripAngleBrackets(result.messageId || "");
+		return { messageId: result.messageId, wireMessageId };
+	} catch (err) {
+		const msg = (err as Error).message || "";
+		// If the binding rejects an explicit Message-ID header, retry without it
+		// and adopt the provider-assigned messageId so SQLite threading stays aligned.
+		if (
+			params.headers &&
+			/message-id/i.test(msg) &&
+			/(header|forbidden|disallowed|invalid|not allowed)/i.test(msg)
+		) {
+			const filteredHeaders: Record<string, string> = {};
+			for (const [k, v] of Object.entries(params.headers)) {
+				if (k.toLowerCase() !== "message-id") {
+					filteredHeaders[k] = v;
+				}
+			}
+			const retryResult = await binding.send(
+				buildPayload(filteredHeaders) as any,
+			);
+			const wireMessageId = stripAngleBrackets(retryResult.messageId || "");
+			return { messageId: retryResult.messageId, wireMessageId };
+		}
+		throw err;
 	}
-
-	const result = await binding.send(message as any);
-	return { messageId: result.messageId };
 }

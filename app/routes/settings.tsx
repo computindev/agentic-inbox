@@ -35,7 +35,7 @@ export default function SettingsRoute() {
 		const settings = {
 			...mailbox.settings,
 			fromName: displayName,
-			agentSystemPrompt: agentPrompt.trim() || undefined,
+			agentSystemPrompt: agentPrompt.trim(),
 		};
 		try {
 			await updateMailboxMutation.mutateAsync({ mailboxId, settings });
